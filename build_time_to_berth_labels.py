@@ -73,11 +73,15 @@ def main() -> None:
                   pc.basin_start_utc AS label_ts_utc,
                   'TTB' AS label_type,
                   -- For censored: use time since basin_start to batch_ts; for completed: actual TTB
-                  CASE 
-                    WHEN pc.berth_start_utc IS NULL THEN 
-                      EXTRACT(EPOCH FROM (:batch_ts - pc.basin_start_utc))/3600.0
-                    ELSE pc.time_to_berth_hours
-                  END AS label_wait_hours,
+                  -- Cap at 500h to handle extreme outliers (winsorization)
+                  LEAST(
+                    CASE 
+                      WHEN pc.berth_start_utc IS NULL THEN 
+                        EXTRACT(EPOCH FROM (:batch_ts - pc.basin_start_utc))/3600.0
+                      ELSE pc.time_to_berth_hours
+                    END,
+                    500.0
+                  ) AS label_wait_hours,
                   -- Mark as censored if berth_start_utc is NULL (vessel still waiting)
                   CASE WHEN pc.berth_start_utc IS NULL THEN TRUE ELSE FALSE END AS censored,
                   jsonb_build_object(
@@ -92,7 +96,16 @@ def main() -> None:
                     'vessel_draught_avg', vi.draught_avg,
                     'vessel_length_m', vi.length_m,
                     'vessel_beam_m', vi.beam_m,
-                    'vessel_type', vi.vessel_type,
+                    -- Group vessel types into broader categories + handle missing
+                    'vessel_type_grouped', CASE
+                      WHEN vi.vessel_type IS NULL THEN 'Unknown'
+                      WHEN vi.vessel_type ILIKE '%cargo%' THEN 'Cargo'
+                      WHEN vi.vessel_type ILIKE '%tanker%' THEN 'Tanker'
+                      WHEN vi.vessel_type ILIKE '%passenger%' THEN 'Passenger'
+                      WHEN vi.vessel_type ILIKE '%hazard%' THEN 'Hazardous'
+                      WHEN vi.vessel_type ILIKE '%container%' THEN 'Container'
+                      ELSE 'Other'
+                    END,
 
                     -- congestion now (distinct MMSI in role zones within window-min)
                     'queue_mmsi_30m', (
@@ -175,6 +188,8 @@ def main() -> None:
                   )
                   AND pc.basin_start_utc >= (now() AT TIME ZONE 'utc') - (:d || ' days')::interval
                   AND pc.mmsi ~ '^[0-9]{7,9}$'
+                  -- CARGO FOCUS: Only train on cargo vessels (export/import focus)
+                  AND (vi.vessel_type IS NULL OR vi.vessel_type ILIKE '%cargo%')
                   -- anti-tug filter ONLY here (ML layer)
                   AND (vi.vessel_type IS NULL OR vi.vessel_type NOT ILIKE '%tug%')
                   AND (vi.length_m IS NULL OR vi.length_m >= 70);

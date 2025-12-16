@@ -19,7 +19,6 @@ def main() -> None:
     ap.add_argument("--ports", required=True, help="Comma-separated port codes (e.g., STS,PNG)")
     ap.add_argument("--since-days", type=int, default=365)
     ap.add_argument("--replace-since", action="store_true")
-    ap.add_argument("--cap-hours", type=float, default=336.0, help="Drop labels above this (default 14d)")
     ap.add_argument("--window-min", type=int, default=30, help="Window (minutes) for 'now' congestion features (default 30)")
     args = ap.parse_args()
 
@@ -28,7 +27,8 @@ def main() -> None:
         raise SystemExit("no ports")
 
     print("=== BUILD TTB LABELS -> ml_training_samples_multiport ===")
-    print(f"ports={ports} since_days={args.since_days} replace={args.replace_since} cap_hours={args.cap_hours} window_min={args.window_min}")
+    print(f"ports={ports} since_days={args.since_days} replace={args.replace_since} window_min={args.window_min}")
+    print("NOTE: Now includes censored data (vessels still waiting) for survival analysis")
 
     # Create table if missing (does not modify existing)
     with engine.begin() as conn:
@@ -41,6 +41,7 @@ def main() -> None:
           label_type text NOT NULL,
           label_wait_hours double precision,
           features jsonb NOT NULL DEFAULT '{}'::jsonb,
+          censored boolean DEFAULT FALSE,
           created_at timestamptz NOT NULL DEFAULT now()
         );
         """))
@@ -60,21 +61,36 @@ def main() -> None:
             # - label_ts_utc = pc.basin_start_utc
             # - congestion uses only AIS points <= label_ts_utc (lookback windows)
             # IMPORTANT type cast: vessel_info.mmsi is BIGINT, port_calls_multiport.mmsi is TEXT
+            # Censoring: include both completed and censored (berth_start_utc IS NULL) events
             conn.execute(text("""
                 INSERT INTO public.ml_training_samples_multiport
-                  (port_code, mmsi, label_ts_utc, label_type, label_wait_hours, features)
+                  (port_code, mmsi, label_ts_utc, label_type, label_wait_hours, censored, features)
                 SELECT
                   pc.port_code,
                   pc.mmsi,
                   pc.basin_start_utc AS label_ts_utc,
                   'TTB' AS label_type,
-                  pc.time_to_berth_hours AS label_wait_hours,
+                  -- For censored: use time since basin_start to now; for completed: actual TTB
+                  CASE 
+                    WHEN pc.berth_start_utc IS NULL THEN 
+                      EXTRACT(EPOCH FROM (now() AT TIME ZONE 'utc' - pc.basin_start_utc))/3600.0
+                    ELSE pc.time_to_berth_hours
+                  END AS label_wait_hours,
+                  -- Mark as censored if berth_start_utc is NULL (vessel still waiting)
+                  CASE WHEN pc.berth_start_utc IS NULL THEN TRUE ELSE FALSE END AS censored,
                   jsonb_build_object(
                     -- calendar (UTC)
                     'hour_utc',  EXTRACT(HOUR  FROM (pc.basin_start_utc AT TIME ZONE 'utc')),
                     'dow_utc',   EXTRACT(DOW   FROM (pc.basin_start_utc AT TIME ZONE 'utc')),
                     'month_utc', EXTRACT(MONTH FROM (pc.basin_start_utc AT TIME ZONE 'utc')),
                     'is_weekend', CASE WHEN EXTRACT(DOW FROM (pc.basin_start_utc AT TIME ZONE 'utc')) IN (0,6) THEN 1 ELSE 0 END,
+
+                    -- vessel metadata (from vessel_info, leak-safe as it's static or historical)
+                    'vessel_deadweight', vi.deadweight,
+                    'vessel_draught_avg', vi.draught_avg,
+                    'vessel_length_m', vi.length_m,
+                    'vessel_beam_m', vi.beam_m,
+                    'vessel_type', vi.vessel_type,
 
                     -- congestion now (distinct MMSI in role zones within window-min)
                     'queue_mmsi_30m', (
@@ -150,15 +166,17 @@ def main() -> None:
                   ON vi.mmsi::text = pc.mmsi
                 WHERE pc.port_code = :p
                   AND pc.basin_start_utc IS NOT NULL
-                  AND pc.time_to_berth_hours IS NOT NULL
-                  AND pc.time_to_berth_hours > 0
-                  AND pc.time_to_berth_hours <= :cap
+                  -- Include both completed (time_to_berth_hours > 0) and censored (berth_start IS NULL) events
+                  AND (
+                    (pc.time_to_berth_hours IS NOT NULL AND pc.time_to_berth_hours > 0)
+                    OR pc.berth_start_utc IS NULL
+                  )
                   AND pc.basin_start_utc >= (now() AT TIME ZONE 'utc') - (:d || ' days')::interval
                   AND pc.mmsi ~ '^[0-9]{7,9}$'
                   -- anti-tug filter ONLY here (ML layer)
                   AND (vi.vessel_type IS NULL OR vi.vessel_type NOT ILIKE '%tug%')
                   AND (vi.length_m IS NULL OR vi.length_m >= 70);
-            """), {"p": port, "d": args.since_days, "cap": float(args.cap_hours), "wmin": int(args.window_min)})
+            """), {"p": port, "d": args.since_days, "wmin": int(args.window_min)})
 
             n = conn.execute(text("""
                 SELECT COUNT(*)

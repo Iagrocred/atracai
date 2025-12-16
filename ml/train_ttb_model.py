@@ -1,4 +1,3 @@
-to-brasil/atracai/ml # cat train_ttb_model.py
 #!/usr/bin/env python3
 """
 Train best-practice AIS-only TTB models:
@@ -46,7 +45,8 @@ def _safe_dump(obj, path: str) -> None:
 
 def _safe_load_samples(engine, port_code: str | None):
     sql = """
-      SELECT port_code, label_ts_utc, label_wait_hours, features
+      SELECT port_code, label_ts_utc, label_wait_hours, features, 
+             COALESCE(censored, FALSE) as censored
       FROM public.ml_training_samples_multiport
       WHERE label_type='TTB'
         AND label_wait_hours IS NOT NULL
@@ -86,11 +86,18 @@ def main() -> int:
 
     y = df["label_wait_hours"].astype("float64").values
     y_log = np.log1p(y)
+    censored = df["censored"].astype("bool").values
 
     ts = pd.to_datetime(df["label_ts_utc"], utc=True)
     cutoff = ts.max() - pd.Timedelta(days=int(args.test_days))
     test_idx = ts >= cutoff
     train_idx = ~test_idx
+
+    # Report censoring statistics
+    n_censored_train = censored[train_idx].sum()
+    n_censored_test = censored[test_idx].sum()
+    print(f"[CENSORING] Train: {n_censored_train}/{train_idx.sum()} ({100*n_censored_train/train_idx.sum():.1f}%) censored")
+    print(f"[CENSORING] Test: {n_censored_test}/{test_idx.sum()} ({100*n_censored_test/test_idx.sum():.1f}%) censored")
 
     if train_idx.sum() < 200 or test_idx.sum() < 50:
         raise SystemExit("Time split too small; reduce --test-days or load more history.")
@@ -98,6 +105,7 @@ def main() -> int:
     X_train, X_test = X.loc[train_idx], X.loc[test_idx]
     y_train_log, y_test_log = y_log[train_idx.values], y_log[test_idx.values]
     y_test = y[test_idx.values]
+    censored_test = censored[test_idx.values]
 
     cat_cols = ["port_code"]
     num_cols = [c for c in X.columns if c not in cat_cols]
@@ -135,13 +143,30 @@ def main() -> int:
         pred_log = pipe.predict(X_test)
         pred = np.expm1(pred_log)  # back-transform to hours
 
-        mae = float(mean_absolute_error(y_test, pred))
-        rmse = float(math.sqrt(mean_squared_error(y_test, pred)))
-        p90ae = _p90_abs_err(y_test, pred)
-        bias = float(np.mean(pred - y_test))
+        # Evaluate only on completed (non-censored) test events for accuracy
+        completed_mask = ~censored_test
+        if completed_mask.sum() == 0:
+            print(f"WARNING: No completed events in test set for {out_path}")
+            mae = rmse = p90ae = bias = float('nan')
+        else:
+            y_test_completed = y_test[completed_mask]
+            pred_completed = pred[completed_mask]
+            mae = float(mean_absolute_error(y_test_completed, pred_completed))
+            rmse = float(math.sqrt(mean_squared_error(y_test_completed, pred_completed)))
+            p90ae = _p90_abs_err(y_test_completed, pred_completed)
+            bias = float(np.mean(pred_completed - y_test_completed))
 
         _safe_dump(pipe, out_path)
-        return {"out": out_path, "mae": mae, "rmse": rmse, "p90ae": p90ae, "bias": bias}
+        return {
+            "out": out_path, 
+            "mae": mae, 
+            "rmse": rmse, 
+            "p90ae": p90ae, 
+            "bias": bias,
+            "eval_on_completed_only": True,
+            "n_test_completed": int(completed_mask.sum()),
+            "n_test_total": int(len(censored_test))
+        }
 
     # Point model: optimize absolute error in log space (robust)
     point = train_model(loss="absolute_error", quantile=None, out_path="models/ttb_point_log.pkl")
@@ -155,6 +180,10 @@ def main() -> int:
         "rows_total": int(len(df)),
         "rows_train": int(train_idx.sum()),
         "rows_test": int(test_idx.sum()),
+        "censored_train": int(n_censored_train),
+        "censored_test": int(n_censored_test),
+        "censored_pct_train": float(100 * n_censored_train / train_idx.sum()),
+        "censored_pct_test": float(100 * n_censored_test / test_idx.sum()),
         "cutoff_ts_utc": cutoff.isoformat(),
         "port_filter": args.port_code,
         "models": {
@@ -164,7 +193,7 @@ def main() -> int:
             "q90": q90,
         },
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
-        "note": "All models trained on log1p(y) and back-transformed; features are AIS-only and leakage-safe."
+        "note": "All models trained on log1p(y) and back-transformed; features are AIS-only and leakage-safe. Censored samples included in training but evaluation metrics computed on completed events only."
     }
 
     with open("logs/ttb_train_report_v2.json", "w") as f:
@@ -178,4 +207,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-(base) root@Ubuntu-2404-noble-amd64-base ~/custo-brasil/atracai/ml #
+

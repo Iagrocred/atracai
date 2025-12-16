@@ -191,4 +191,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-(base) root@Ubuntu-2404-noble-amd64-base ~/custo-brasil/atracai/calls #
+

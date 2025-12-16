@@ -62,6 +62,8 @@ def main() -> None:
             # - congestion uses only AIS points <= label_ts_utc (lookback windows)
             # IMPORTANT type cast: vessel_info.mmsi is BIGINT, port_calls_multiport.mmsi is TEXT
             # Censoring: include both completed and censored (berth_start_utc IS NULL) events
+            # Use consistent timestamp for entire batch to ensure reproducibility
+            batch_ts = conn.execute(text("SELECT now() AT TIME ZONE 'utc'")).scalar()
             conn.execute(text("""
                 INSERT INTO public.ml_training_samples_multiport
                   (port_code, mmsi, label_ts_utc, label_type, label_wait_hours, censored, features)
@@ -70,10 +72,10 @@ def main() -> None:
                   pc.mmsi,
                   pc.basin_start_utc AS label_ts_utc,
                   'TTB' AS label_type,
-                  -- For censored: use time since basin_start to now; for completed: actual TTB
+                  -- For censored: use time since basin_start to batch_ts; for completed: actual TTB
                   CASE 
                     WHEN pc.berth_start_utc IS NULL THEN 
-                      EXTRACT(EPOCH FROM (now() AT TIME ZONE 'utc' - pc.basin_start_utc))/3600.0
+                      EXTRACT(EPOCH FROM (:batch_ts - pc.basin_start_utc))/3600.0
                     ELSE pc.time_to_berth_hours
                   END AS label_wait_hours,
                   -- Mark as censored if berth_start_utc is NULL (vessel still waiting)
@@ -176,7 +178,7 @@ def main() -> None:
                   -- anti-tug filter ONLY here (ML layer)
                   AND (vi.vessel_type IS NULL OR vi.vessel_type NOT ILIKE '%tug%')
                   AND (vi.length_m IS NULL OR vi.length_m >= 70);
-            """), {"p": port, "d": args.since_days, "wmin": int(args.window_min)})
+            """), {"p": port, "d": args.since_days, "wmin": int(args.window_min), "batch_ts": batch_ts})
 
             n = conn.execute(text("""
                 SELECT COUNT(*)

@@ -32,10 +32,15 @@ COMMENT ON INDEX idx_ml_samples_label_ts IS
 'Speed up time-based splits for model training and evaluation';
 
 -- 5. Update existing port_calls_multiport rows to mark censored calls
+-- Limit to recent data for performance (last 2 years)
 UPDATE port_calls_multiport
 SET censoring_flag = TRUE
 WHERE berth_start_utc IS NULL
-  AND basin_start_utc IS NOT NULL;
+  AND basin_start_utc IS NOT NULL
+  AND basin_start_utc >= (now() AT TIME ZONE 'utc') - interval '2 years';
+
+-- Note: For older data, censoring_flag will be set by build_port_calls_multiport.py
+-- when those records are processed
 
 COMMENT ON TABLE port_calls_multiport IS 
 'Port calls with session-based aggregation, zone timestamps, and censoring support for TTB prediction';

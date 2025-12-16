@@ -193,7 +193,12 @@ def main() -> int:
             "q90": q90,
         },
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
-        "note": "All models trained on log1p(y) and back-transformed; features are AIS-only and leakage-safe. Censored samples included in training but evaluation metrics computed on completed events only."
+        "training_config": {
+            "target_transform": "log1p",
+            "features": "AIS-only, leakage-safe",
+            "censoring": "Included in training, excluded from evaluation metrics",
+            "evaluation": "Metrics computed on completed events only"
+        }
     }
 
     with open("logs/ttb_train_report_v2.json", "w") as f:

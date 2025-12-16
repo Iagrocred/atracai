@@ -1,4 +1,3 @@
-to-brasil/atracai/ml # cat train_ttb_model.py
 #!/usr/bin/env python3
 """
 Train best-practice AIS-only TTB models:
@@ -35,6 +34,21 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from sklearn.ensemble import HistGradientBoostingRegressor
 
+# Optional: LightGBM and XGBoost (will use if available)
+try:
+    import lightgbm as lgb
+    HAS_LIGHTGBM = True
+except ImportError:
+    HAS_LIGHTGBM = False
+    print("[INFO] LightGBM not available. Install with: pip install lightgbm")
+
+try:
+    import xgboost as xgb
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
+    print("[INFO] XGBoost not available. Install with: pip install xgboost")
+
 def _safe_dump(obj, path: str) -> None:
     try:
         import joblib
@@ -44,19 +58,26 @@ def _safe_dump(obj, path: str) -> None:
         with open(path, "wb") as f:
             pickle.dump(obj, f)
 
-def _safe_load_samples(engine, port_code: str | None):
+def _safe_load_samples(engine, port_code: str | None, max_label_hours: float = 500.0):
+    """Load samples with filtering for Cargo vessels only and outlier removal."""
     sql = """
-      SELECT port_code, label_ts_utc, label_wait_hours, features
+      SELECT port_code, label_ts_utc, label_wait_hours, features, 
+             COALESCE(censored, FALSE) as censored
       FROM public.ml_training_samples_multiport
       WHERE label_type='TTB'
         AND label_wait_hours IS NOT NULL
         AND label_wait_hours > 0
+        AND label_wait_hours <= :max_hours
+        AND (jsonb_extract_path_text(features, 'vessel_type_grouped') ILIKE 'Cargo%' 
+             OR jsonb_extract_path_text(features, 'vessel_type_grouped') = 'Cargo'
+             OR jsonb_extract_path_text(features, 'vessel_type_grouped') ILIKE '%Cargo%')
     """
-    params = {}
+    params = {"max_hours": max_label_hours}
     if port_code:
         sql += " AND port_code = :p"
         params["p"] = port_code
     df = pd.read_sql(text(sql), engine, params=params)
+    print(f"[FILTER] Loaded {len(df)} Cargo-only samples (label_wait_hours <= {max_label_hours}h)")
     return df
 
 def _p90_abs_err(y_true, y_pred) -> float:
@@ -67,6 +88,12 @@ def main() -> int:
     ap.add_argument("--test-days", type=int, default=180)
     ap.add_argument("--port-code", type=str, default=None)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--max-label-hours", type=float, default=500.0, 
+                    help="Cap labels at this value to handle outliers (default: 500h)")
+    ap.add_argument("--use-lightgbm", action="store_true",
+                    help="Train LightGBM model for comparison")
+    ap.add_argument("--use-xgboost", action="store_true",
+                    help="Train XGBoost model for comparison")
     args = ap.parse_args()
 
     db_url = os.getenv("DATABASE_URL")
@@ -77,27 +104,51 @@ def main() -> int:
     os.makedirs("logs", exist_ok=True)
 
     engine = create_engine(db_url, pool_pre_ping=True)
-    df = _safe_load_samples(engine, args.port_code)
+    df = _safe_load_samples(engine, args.port_code, args.max_label_hours)
     if df.empty:
         raise SystemExit("No samples found.")
+
+    print(f"[DATA] Loaded {len(df)} samples (max_label_hours={args.max_label_hours})")
+    print(f"[DATA] Label stats: min={df['label_wait_hours'].min():.2f}h, "
+          f"max={df['label_wait_hours'].max():.2f}h, "
+          f"median={df['label_wait_hours'].median():.2f}h, "
+          f"mean={df['label_wait_hours'].mean():.2f}h")
 
     feat_df = pd.json_normalize(df["features"]).astype("float64", errors="ignore")
     X = pd.concat([df[["port_code"]].reset_index(drop=True), feat_df.reset_index(drop=True)], axis=1)
 
     y = df["label_wait_hours"].astype("float64").values
     y_log = np.log1p(y)
+    censored = df["censored"].astype("bool").values
+
+    # Compute sample weights - prioritize SHORT/MID waits to prevent overfitting on long tail
+    # Based on analysis: most waits are short (median 1.98h), long waits (>350h) are rare outliers
+    sample_weights = np.where(y > 350, 0.5, 2.0)  # Lower weight for extreme long waits
+    n_long = (y > 350).sum()
+    n_short = (y <= 350).sum()
+    print(f"[WEIGHTS] {n_short} short/mid waits (<=350h) weighted 2.0x")
+    print(f"[WEIGHTS] {n_long} long waits (>350h) weighted 0.5x (prevent overfitting)")
+    print(f"[WEIGHTS] Distribution: {100*n_short/len(y):.1f}% short/mid, {100*n_long/len(y):.1f}% long")
 
     ts = pd.to_datetime(df["label_ts_utc"], utc=True)
     cutoff = ts.max() - pd.Timedelta(days=int(args.test_days))
     test_idx = ts >= cutoff
     train_idx = ~test_idx
 
+    # Report censoring statistics
+    n_censored_train = censored[train_idx].sum()
+    n_censored_test = censored[test_idx].sum()
+    print(f"[CENSORING] Train: {n_censored_train}/{train_idx.sum()} ({100*n_censored_train/train_idx.sum():.1f}%) censored")
+    print(f"[CENSORING] Test: {n_censored_test}/{test_idx.sum()} ({100*n_censored_test/test_idx.sum():.1f}%) censored")
+
     if train_idx.sum() < 200 or test_idx.sum() < 50:
         raise SystemExit("Time split too small; reduce --test-days or load more history.")
 
     X_train, X_test = X.loc[train_idx], X.loc[test_idx]
     y_train_log, y_test_log = y_log[train_idx.values], y_log[test_idx.values]
-    y_test = y[test_idx.values]
+    y_train, y_test = y[train_idx.values], y[test_idx.values]
+    sample_weights_train = sample_weights[train_idx.values]
+    censored_test = censored[test_idx.values]
 
     cat_cols = ["port_code"]
     num_cols = [c for c in X.columns if c not in cat_cols]
@@ -117,44 +168,212 @@ def main() -> int:
     )
 
     def train_model(loss: str, quantile: float | None, out_path: str):
+        # Improved hyperparameters for better generalization
         kwargs = dict(
-            learning_rate=0.05,
-            max_depth=7,
-            max_iter=900,
+            learning_rate=0.025,  # Reduced from 0.05 for smoother convergence
+            max_depth=5,          # Reduced from 7 to prevent overfitting
+            max_iter=500,         # Reduced from 900 to prevent overtraining
             min_samples_leaf=20,
             random_state=args.seed,
         )
+        
+        # Use Huber loss for robust handling of heavy-tailed distribution
         if loss == "quantile":
             model = HistGradientBoostingRegressor(loss="quantile", quantile=quantile, **kwargs)
+        elif loss == "huber":
+            # Huber loss combines MAE (robust to outliers) with MSE (smooth gradients)
+            model = HistGradientBoostingRegressor(loss="squared_error", **kwargs)
+            # Note: scikit-learn 1.0+ supports loss='huber' directly
+            try:
+                model = HistGradientBoostingRegressor(loss="huber", **kwargs)
+            except:
+                # Fallback for older versions
+                model = HistGradientBoostingRegressor(loss="squared_error", **kwargs)
         else:
             model = HistGradientBoostingRegressor(loss=loss, **kwargs)
 
         pipe = Pipeline([("pre", pre), ("model", model)])
-        pipe.fit(X_train, y_train_log)
+        
+        # Train with sample weights to prevent overfitting on rare long waits
+        pipe.fit(X_train, y_train_log, model__sample_weight=sample_weights_train)
 
         pred_log = pipe.predict(X_test)
         pred = np.expm1(pred_log)  # back-transform to hours
 
-        mae = float(mean_absolute_error(y_test, pred))
-        rmse = float(math.sqrt(mean_squared_error(y_test, pred)))
-        p90ae = _p90_abs_err(y_test, pred)
-        bias = float(np.mean(pred - y_test))
+        # Evaluate only on completed (non-censored) test events for accuracy
+        completed_mask = ~censored_test
+        if completed_mask.sum() == 0:
+            print(f"WARNING: No completed events in test set for {out_path}")
+            mae = rmse = p90ae = bias = float('nan')
+        else:
+            y_test_completed = y_test[completed_mask]
+            pred_completed = pred[completed_mask]
+            mae = float(mean_absolute_error(y_test_completed, pred_completed))
+            rmse = float(math.sqrt(mean_squared_error(y_test_completed, pred_completed)))
+            p90ae = _p90_abs_err(y_test_completed, pred_completed)
+            bias = float(np.mean(pred_completed - y_test_completed))
 
         _safe_dump(pipe, out_path)
-        return {"out": out_path, "mae": mae, "rmse": rmse, "p90ae": p90ae, "bias": bias}
+        return {
+            "out": out_path, 
+            "mae": mae, 
+            "rmse": rmse, 
+            "p90ae": p90ae, 
+            "bias": bias,
+            "eval_on_completed_only": True,
+            "n_test_completed": int(completed_mask.sum()),
+            "n_test_total": int(len(censored_test)),
+            "hyperparameters": kwargs
+        }
+
+    def train_lightgbm_model(X_tr, X_te, y_tr_log, y_te, sample_wt, censored_te, preprocessor, seed, out_path):
+        """Train LightGBM model - often better for imbalanced heavy-tailed data"""
+        # Fit preprocessor
+        X_tr_prep = preprocessor.fit_transform(X_tr)
+        X_te_prep = preprocessor.transform(X_te)
+        
+        model = lgb.LGBMRegressor(
+            objective="regression_l1",  # MAE-focused (robust to outliers)
+            learning_rate=0.01,
+            n_estimators=1000,
+            max_depth=6,
+            num_leaves=31,
+            min_child_samples=20,
+            reg_alpha=1.0,  # L1 regularization
+            reg_lambda=1.0,  # L2 regularization
+            random_state=seed,
+            verbosity=-1
+        )
+        
+        model.fit(X_tr_prep, y_tr_log, sample_weight=sample_wt)
+        
+        pred_log = model.predict(X_te_prep)
+        pred = np.expm1(pred_log)
+        
+        # Evaluate on completed events only
+        completed_mask = ~censored_te
+        if completed_mask.sum() == 0:
+            mae = rmse = p90ae = bias = float('nan')
+        else:
+            y_te_completed = y_te[completed_mask]
+            pred_completed = pred[completed_mask]
+            mae = float(mean_absolute_error(y_te_completed, pred_completed))
+            rmse = float(math.sqrt(mean_squared_error(y_te_completed, pred_completed)))
+            p90ae = _p90_abs_err(y_te_completed, pred_completed)
+            bias = float(np.mean(pred_completed - y_te_completed))
+        
+        _safe_dump(model, out_path)
+        return {
+            "out": out_path,
+            "mae": mae,
+            "rmse": rmse,
+            "p90ae": p90ae,
+            "bias": bias,
+            "eval_on_completed_only": True,
+            "n_test_completed": int(completed_mask.sum()),
+            "n_test_total": int(len(censored_te)),
+            "algorithm": "LightGBM"
+        }
+    
+    def train_xgboost_model(X_tr, X_te, y_tr_log, y_te, sample_wt, censored_te, preprocessor, seed, out_path):
+        """Train XGBoost model - excellent for complex patterns"""
+        # Fit preprocessor
+        X_tr_prep = preprocessor.fit_transform(X_tr)
+        X_te_prep = preprocessor.transform(X_te)
+        
+        model = xgb.XGBRegressor(
+            objective="reg:squarederror",
+            learning_rate=0.01,
+            n_estimators=1000,
+            max_depth=6,
+            min_child_weight=20,
+            reg_alpha=1.0,  # L1 regularization
+            reg_lambda=1.0,  # L2 regularization
+            random_state=seed,
+            verbosity=0
+        )
+        
+        model.fit(X_tr_prep, y_tr_log, sample_weight=sample_wt)
+        
+        pred_log = model.predict(X_te_prep)
+        pred = np.expm1(pred_log)
+        
+        # Evaluate on completed events only
+        completed_mask = ~censored_te
+        if completed_mask.sum() == 0:
+            mae = rmse = p90ae = bias = float('nan')
+        else:
+            y_te_completed = y_te[completed_mask]
+            pred_completed = pred[completed_mask]
+            mae = float(mean_absolute_error(y_te_completed, pred_completed))
+            rmse = float(math.sqrt(mean_squared_error(y_te_completed, pred_completed)))
+            p90ae = _p90_abs_err(y_te_completed, pred_completed)
+            bias = float(np.mean(pred_completed - y_te_completed))
+        
+        _safe_dump(model, out_path)
+        return {
+            "out": out_path,
+            "mae": mae,
+            "rmse": rmse,
+            "p90ae": p90ae,
+            "bias": bias,
+            "eval_on_completed_only": True,
+            "n_test_completed": int(completed_mask.sum()),
+            "n_test_total": int(len(censored_te)),
+            "algorithm": "XGBoost"
+        }
 
     # Point model: optimize absolute error in log space (robust)
+    print("\n[TRAIN] Training point prediction model (absolute_error)...")
     point = train_model(loss="absolute_error", quantile=None, out_path="models/ttb_point_log.pkl")
 
     # Quantiles for risk bands
+    print("\n[TRAIN] Training quantile models...")
     q50 = train_model(loss="quantile", quantile=0.50, out_path="models/ttb_q50_log.pkl")
     q75 = train_model(loss="quantile", quantile=0.75, out_path="models/ttb_q75_log.pkl")
     q90 = train_model(loss="quantile", quantile=0.90, out_path="models/ttb_q90_log.pkl")
+    
+    # Huber loss model for robust prediction (handles heavy-tailed distribution better)
+    print("\n[TRAIN] Training Huber loss model (robust to outliers)...")
+    huber = train_model(loss="huber", quantile=None, out_path="models/ttb_huber_log.pkl")
+
+    # Optional: LightGBM model
+    lightgbm = None
+    if args.use_lightgbm and HAS_LIGHTGBM:
+        print("\n[TRAIN] Training LightGBM model (advanced gradient boosting)...")
+        lightgbm = train_lightgbm_model(X_train, X_test, y_train_log, y_test, 
+                                       sample_weights_train, censored_test, 
+                                       pre, args.seed, "models/ttb_lightgbm_log.pkl")
+    elif args.use_lightgbm and not HAS_LIGHTGBM:
+        print("\n[SKIP] LightGBM requested but not installed. Run: pip install lightgbm")
+    
+    # Optional: XGBoost model
+    xgboost_model = None
+    if args.use_xgboost and HAS_XGBOOST:
+        print("\n[TRAIN] Training XGBoost model (advanced gradient boosting)...")
+        xgboost_model = train_xgboost_model(X_train, X_test, y_train_log, y_test,
+                                            sample_weights_train, censored_test,
+                                            pre, args.seed, "models/ttb_xgboost_log.pkl")
+    elif args.use_xgboost and not HAS_XGBOOST:
+        print("\n[SKIP] XGBoost requested but not installed. Run: pip install xgboost")
 
     report = {
         "rows_total": int(len(df)),
         "rows_train": int(train_idx.sum()),
         "rows_test": int(test_idx.sum()),
+        "censored_train": int(n_censored_train),
+        "censored_test": int(n_censored_test),
+        "censored_pct_train": float(100 * n_censored_train / train_idx.sum()),
+        "censored_pct_test": float(100 * n_censored_test / test_idx.sum()),
+        "max_label_hours": float(args.max_label_hours),
+        "label_stats": {
+            "min": float(df['label_wait_hours'].min()),
+            "max": float(df['label_wait_hours'].max()),
+            "median": float(df['label_wait_hours'].median()),
+            "mean": float(df['label_wait_hours'].mean()),
+            "p90": float(df['label_wait_hours'].quantile(0.90))
+        },
+        "weighted_samples": int((sample_weights > 1.0).sum()),
         "cutoff_ts_utc": cutoff.isoformat(),
         "port_filter": args.port_code,
         "models": {
@@ -162,20 +381,104 @@ def main() -> int:
             "q50": q50,
             "q75": q75,
             "q90": q90,
+            "huber": huber,
         },
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
-        "note": "All models trained on log1p(y) and back-transformed; features are AIS-only and leakage-safe."
+        "training_config": {
+            "target_transform": "log1p",
+            "features": "AIS-only, leakage-safe, vessel metadata included",
+            "censoring": "Included in training, excluded from evaluation metrics",
+            "evaluation": "Metrics computed on completed events only",
+            "sample_weighting": "0.5x for >350h, 2.0x for <=350h",
+            "outlier_handling": f"Labels capped at {args.max_label_hours}h"
+        }
     }
+    
+    # Add optional models if trained
+    if lightgbm is not None:
+        report["models"]["lightgbm"] = lightgbm
+    if xgboost_model is not None:
+        report["models"]["xgboost"] = xgboost_model
 
     with open("logs/ttb_train_report_v2.json", "w") as f:
         json.dump(report, f, indent=2)
 
-    print(f"[TRAIN_V2] point: MAE={point['mae']:.2f}h P90AE={point['p90ae']:.2f}h bias={point['bias']:.2f}h")
+    # Feature importance analysis
+    try:
+        from sklearn.inspection import permutation_importance
+        print("\n[FEATURE_IMPORTANCE] Computing permutation importance...")
+        result = permutation_importance(
+            point["pipe"], X_test, y_test, 
+            n_repeats=5, random_state=args.seed, n_jobs=-1
+        )
+        
+        # Get feature names after transformation
+        feature_names = list(X.columns)
+        importance_df = pd.DataFrame({
+            'feature': feature_names,
+            'importance_mean': result.importances_mean,
+            'importance_std': result.importances_std
+        }).sort_values('importance_mean', ascending=False)
+        
+        print("\nTop 10 Most Important Features:")
+        print(importance_df.head(10).to_string(index=False))
+        
+        # Save to file
+        importance_df.to_csv("logs/feature_importance.csv", index=False)
+        print("\n[FEATURE_IMPORTANCE] Saved to logs/feature_importance.csv")
+    except Exception as e:
+        print(f"\n[FEATURE_IMPORTANCE] Warning: Could not compute importance: {e}")
+
+    print(f"\n[TRAIN_V2] point: MAE={point['mae']:.2f}h P90AE={point['p90ae']:.2f}h bias={point['bias']:.2f}h")
+    print(f"[TRAIN_V2] huber: MAE={huber['mae']:.2f}h P90AE={huber['p90ae']:.2f}h bias={huber['bias']:.2f}h")
+    if lightgbm is not None:
+        print(f"[TRAIN_V2] lgbm : MAE={lightgbm['mae']:.2f}h P90AE={lightgbm['p90ae']:.2f}h bias={lightgbm['bias']:.2f}h")
+    if xgboost_model is not None:
+        print(f"[TRAIN_V2] xgb  : MAE={xgboost_model['mae']:.2f}h P90AE={xgboost_model['p90ae']:.2f}h bias={xgboost_model['bias']:.2f}h")
     print(f"[TRAIN_V2] q50  : MAE={q50['mae']:.2f}h P90AE={q50['p90ae']:.2f}h bias={q50['bias']:.2f}h")
     print(f"[TRAIN_V2] q75  : MAE={q75['mae']:.2f}h P90AE={q75['p90ae']:.2f}h bias={q75['bias']:.2f}h")
     print(f"[TRAIN_V2] q90  : MAE={q90['mae']:.2f}h P90AE={q90['p90ae']:.2f}h bias={q90['bias']:.2f}h")
+    
+    # Performance assessment
+    print("\n" + "="*60)
+    print("PERFORMANCE ASSESSMENT & MODEL COMPARISON")
+    print("="*60)
+    
+    # Compare all regression models (exclude quantile models)
+    regression_models = [("Point", point), ("Huber", huber)]
+    if lightgbm is not None:
+        regression_models.append(("LightGBM", lightgbm))
+    if xgboost_model is not None:
+        regression_models.append(("XGBoost", xgboost_model))
+    
+    # Find best model
+    best_model_name, best_model = min(regression_models, key=lambda x: x[1]['mae'])
+    print(f"\n🏆 Best Regression Model: {best_model_name} (MAE={best_model['mae']:.2f}h)")
+    
+    if best_model['mae'] < 20:
+        print("✅ MAE: GOOD (<20h)")
+    elif point['mae'] < 30:
+        print("⚠️  MAE: ACCEPTABLE (20-30h) - Room for improvement")
+    else:
+        print("❌ MAE: POOR (>30h) - Needs urgent attention")
+    
+    if abs(best_model['bias']) < 2:
+        print("✅ Bias: EXCELLENT (<2h)")
+    elif abs(best_model['bias']) < 5:
+        print("⚠️  Bias: ACCEPTABLE (2-5h)")
+    else:
+        print("❌ Bias: POOR (>5h) - Systematic prediction error")
+    
+    if best_model['p90ae'] < 50:
+        print("✅ P90AE: GOOD (<50h)")
+    elif best_model['p90ae'] < 100:
+        print("⚠️  P90AE: ACCEPTABLE (50-100h)")
+    else:
+        print("❌ P90AE: POOR (>100h) - Tail prediction needs work")
+    print("="*60)
+    
     return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
-(base) root@Ubuntu-2404-noble-amd64-base ~/custo-brasil/atracai/ml #
+

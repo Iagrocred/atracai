@@ -246,6 +246,19 @@ def main():
         n = cur.fetchone()[0]
         print(f"  [OK] port_calls in window: {n}")
 
+        # Update censoring_flag for right-censored calls (berth_start_utc IS NULL)
+        cur.execute("""
+            UPDATE public.port_calls_multiport
+            SET censoring_flag = TRUE
+            WHERE port_code=%s
+              AND basin_start_utc IS NOT NULL
+              AND berth_start_utc IS NULL
+              AND call_start_utc >= (now() AT TIME ZONE 'utc') - (%s || ' days')::interval
+        """, (port, args.since_days))
+        censored_count = cur.rowcount
+        conn.commit()
+        print(f"  [OK] marked {censored_count} censored calls (berth_start IS NULL)")
+
     cur.close()
     conn.close()
     print("\n=== DONE BUILD PORT CALLS MULTIPORT ===")

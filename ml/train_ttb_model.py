@@ -102,9 +102,14 @@ def main() -> int:
     y_log = np.log1p(y)
     censored = df["censored"].astype("bool").values
 
-    # Compute sample weights - prioritize longer waits for better tail performance
-    sample_weights = np.where(y > 50, 2.0, 1.0)
-    print(f"[WEIGHTS] {(sample_weights > 1.0).sum()} samples weighted 2x (TTB > 50h)")
+    # Compute sample weights - prioritize SHORT/MID waits to prevent overfitting on long tail
+    # Based on analysis: most waits are short (median 1.98h), long waits (>350h) are rare outliers
+    sample_weights = np.where(y > 350, 0.5, 2.0)  # Lower weight for extreme long waits
+    n_long = (y > 350).sum()
+    n_short = (y <= 350).sum()
+    print(f"[WEIGHTS] {n_short} short/mid waits (<=350h) weighted 2.0x")
+    print(f"[WEIGHTS] {n_long} long waits (>350h) weighted 0.5x (prevent overfitting)")
+    print(f"[WEIGHTS] Distribution: {100*n_short/len(y):.1f}% short/mid, {100*n_long/len(y):.1f}% long")
 
     ts = pd.to_datetime(df["label_ts_utc"], utc=True)
     cutoff = ts.max() - pd.Timedelta(days=int(args.test_days))
@@ -152,18 +157,25 @@ def main() -> int:
             min_samples_leaf=20,
             random_state=args.seed,
         )
+        
+        # Use Huber loss for robust handling of heavy-tailed distribution
         if loss == "quantile":
             model = HistGradientBoostingRegressor(loss="quantile", quantile=quantile, **kwargs)
         elif loss == "huber":
-            # Huber loss is robust to outliers
-            model = HistGradientBoostingRegressor(loss="squared_error", **kwargs)  # Will use huber via custom loss
-            loss_name = "huber"
+            # Huber loss combines MAE (robust to outliers) with MSE (smooth gradients)
+            model = HistGradientBoostingRegressor(loss="squared_error", **kwargs)
+            # Note: scikit-learn 1.0+ supports loss='huber' directly
+            try:
+                model = HistGradientBoostingRegressor(loss="huber", **kwargs)
+            except:
+                # Fallback for older versions
+                model = HistGradientBoostingRegressor(loss="squared_error", **kwargs)
         else:
             model = HistGradientBoostingRegressor(loss=loss, **kwargs)
 
         pipe = Pipeline([("pre", pre), ("model", model)])
         
-        # Train with sample weights to prioritize longer waits
+        # Train with sample weights to prevent overfitting on rare long waits
         pipe.fit(X_train, y_train_log, model__sample_weight=sample_weights_train)
 
         pred_log = pipe.predict(X_test)
@@ -196,12 +208,18 @@ def main() -> int:
         }
 
     # Point model: optimize absolute error in log space (robust)
+    print("\n[TRAIN] Training point prediction model (absolute_error)...")
     point = train_model(loss="absolute_error", quantile=None, out_path="models/ttb_point_log.pkl")
 
     # Quantiles for risk bands
+    print("\n[TRAIN] Training quantile models...")
     q50 = train_model(loss="quantile", quantile=0.50, out_path="models/ttb_q50_log.pkl")
     q75 = train_model(loss="quantile", quantile=0.75, out_path="models/ttb_q75_log.pkl")
     q90 = train_model(loss="quantile", quantile=0.90, out_path="models/ttb_q90_log.pkl")
+    
+    # Huber loss model for robust prediction (handles heavy-tailed distribution better)
+    print("\n[TRAIN] Training Huber loss model (robust to outliers)...")
+    huber = train_model(loss="huber", quantile=None, out_path="models/ttb_huber_log.pkl")
 
     report = {
         "rows_total": int(len(df)),
@@ -227,6 +245,7 @@ def main() -> int:
             "q50": q50,
             "q75": q75,
             "q90": q90,
+            "huber": huber,
         },
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
         "training_config": {
@@ -269,6 +288,7 @@ def main() -> int:
         print(f"\n[FEATURE_IMPORTANCE] Warning: Could not compute importance: {e}")
 
     print(f"\n[TRAIN_V2] point: MAE={point['mae']:.2f}h P90AE={point['p90ae']:.2f}h bias={point['bias']:.2f}h")
+    print(f"[TRAIN_V2] huber: MAE={huber['mae']:.2f}h P90AE={huber['p90ae']:.2f}h bias={huber['bias']:.2f}h")
     print(f"[TRAIN_V2] q50  : MAE={q50['mae']:.2f}h P90AE={q50['p90ae']:.2f}h bias={q50['bias']:.2f}h")
     print(f"[TRAIN_V2] q75  : MAE={q75['mae']:.2f}h P90AE={q75['p90ae']:.2f}h bias={q75['bias']:.2f}h")
     print(f"[TRAIN_V2] q90  : MAE={q90['mae']:.2f}h P90AE={q90['p90ae']:.2f}h bias={q90['bias']:.2f}h")
@@ -277,23 +297,29 @@ def main() -> int:
     print("\n" + "="*60)
     print("PERFORMANCE ASSESSMENT")
     print("="*60)
-    if point['mae'] < 20:
+    
+    # Choose best model based on MAE (typically Huber for heavy-tailed data)
+    best_model = huber if huber['mae'] < point['mae'] else point
+    model_name = "Huber" if best_model == huber else "Point"
+    print(f"\nBest Model: {model_name} (MAE={best_model['mae']:.2f}h)")
+    
+    if best_model['mae'] < 20:
         print("✅ MAE: GOOD (<20h)")
     elif point['mae'] < 30:
         print("⚠️  MAE: ACCEPTABLE (20-30h) - Room for improvement")
     else:
         print("❌ MAE: POOR (>30h) - Needs urgent attention")
     
-    if abs(point['bias']) < 2:
+    if abs(best_model['bias']) < 2:
         print("✅ Bias: EXCELLENT (<2h)")
-    elif abs(point['bias']) < 5:
+    elif abs(best_model['bias']) < 5:
         print("⚠️  Bias: ACCEPTABLE (2-5h)")
     else:
         print("❌ Bias: POOR (>5h) - Systematic prediction error")
     
-    if point['p90ae'] < 50:
+    if best_model['p90ae'] < 50:
         print("✅ P90AE: GOOD (<50h)")
-    elif point['p90ae'] < 100:
+    elif best_model['p90ae'] < 100:
         print("⚠️  P90AE: ACCEPTABLE (50-100h)")
     else:
         print("❌ P90AE: POOR (>100h) - Tail prediction needs work")

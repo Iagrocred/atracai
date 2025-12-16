@@ -34,6 +34,21 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from sklearn.ensemble import HistGradientBoostingRegressor
 
+# Optional: LightGBM and XGBoost (will use if available)
+try:
+    import lightgbm as lgb
+    HAS_LIGHTGBM = True
+except ImportError:
+    HAS_LIGHTGBM = False
+    print("[INFO] LightGBM not available. Install with: pip install lightgbm")
+
+try:
+    import xgboost as xgb
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
+    print("[INFO] XGBoost not available. Install with: pip install xgboost")
+
 def _safe_dump(obj, path: str) -> None:
     try:
         import joblib
@@ -75,6 +90,10 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-label-hours", type=float, default=500.0, 
                     help="Cap labels at this value to handle outliers (default: 500h)")
+    ap.add_argument("--use-lightgbm", action="store_true",
+                    help="Train LightGBM model for comparison")
+    ap.add_argument("--use-xgboost", action="store_true",
+                    help="Train XGBoost model for comparison")
     args = ap.parse_args()
 
     db_url = os.getenv("DATABASE_URL")
@@ -207,6 +226,103 @@ def main() -> int:
             "hyperparameters": kwargs
         }
 
+    def train_lightgbm_model(X_tr, X_te, y_tr_log, y_te, sample_wt, censored_te, preprocessor, seed, out_path):
+        """Train LightGBM model - often better for imbalanced heavy-tailed data"""
+        # Fit preprocessor
+        X_tr_prep = preprocessor.fit_transform(X_tr)
+        X_te_prep = preprocessor.transform(X_te)
+        
+        model = lgb.LGBMRegressor(
+            objective="regression_l1",  # MAE-focused (robust to outliers)
+            learning_rate=0.01,
+            n_estimators=1000,
+            max_depth=6,
+            num_leaves=31,
+            min_child_samples=20,
+            reg_alpha=1.0,  # L1 regularization
+            reg_lambda=1.0,  # L2 regularization
+            random_state=seed,
+            verbosity=-1
+        )
+        
+        model.fit(X_tr_prep, y_tr_log, sample_weight=sample_wt)
+        
+        pred_log = model.predict(X_te_prep)
+        pred = np.expm1(pred_log)
+        
+        # Evaluate on completed events only
+        completed_mask = ~censored_te
+        if completed_mask.sum() == 0:
+            mae = rmse = p90ae = bias = float('nan')
+        else:
+            y_te_completed = y_te[completed_mask]
+            pred_completed = pred[completed_mask]
+            mae = float(mean_absolute_error(y_te_completed, pred_completed))
+            rmse = float(math.sqrt(mean_squared_error(y_te_completed, pred_completed)))
+            p90ae = _p90_abs_err(y_te_completed, pred_completed)
+            bias = float(np.mean(pred_completed - y_te_completed))
+        
+        _safe_dump(model, out_path)
+        return {
+            "out": out_path,
+            "mae": mae,
+            "rmse": rmse,
+            "p90ae": p90ae,
+            "bias": bias,
+            "eval_on_completed_only": True,
+            "n_test_completed": int(completed_mask.sum()),
+            "n_test_total": int(len(censored_te)),
+            "algorithm": "LightGBM"
+        }
+    
+    def train_xgboost_model(X_tr, X_te, y_tr_log, y_te, sample_wt, censored_te, preprocessor, seed, out_path):
+        """Train XGBoost model - excellent for complex patterns"""
+        # Fit preprocessor
+        X_tr_prep = preprocessor.fit_transform(X_tr)
+        X_te_prep = preprocessor.transform(X_te)
+        
+        model = xgb.XGBRegressor(
+            objective="reg:squarederror",
+            learning_rate=0.01,
+            n_estimators=1000,
+            max_depth=6,
+            min_child_weight=20,
+            reg_alpha=1.0,  # L1 regularization
+            reg_lambda=1.0,  # L2 regularization
+            random_state=seed,
+            verbosity=0
+        )
+        
+        model.fit(X_tr_prep, y_tr_log, sample_weight=sample_wt)
+        
+        pred_log = model.predict(X_te_prep)
+        pred = np.expm1(pred_log)
+        
+        # Evaluate on completed events only
+        completed_mask = ~censored_te
+        if completed_mask.sum() == 0:
+            mae = rmse = p90ae = bias = float('nan')
+        else:
+            y_te_completed = y_te[completed_mask]
+            pred_completed = pred[completed_mask]
+            mae = float(mean_absolute_error(y_te_completed, pred_completed))
+            rmse = float(math.sqrt(mean_squared_error(y_te_completed, pred_completed)))
+            p90ae = _p90_abs_err(y_te_completed, pred_completed)
+            bias = float(np.mean(pred_completed - y_te_completed))
+        
+        _safe_dump(model, out_path)
+        return {
+            "out": out_path,
+            "mae": mae,
+            "rmse": rmse,
+            "p90ae": p90ae,
+            "bias": bias,
+            "eval_on_completed_only": True,
+            "n_test_completed": int(completed_mask.sum()),
+            "n_test_total": int(len(censored_te)),
+            "algorithm": "XGBoost"
+        }
+
     # Point model: optimize absolute error in log space (robust)
     print("\n[TRAIN] Training point prediction model (absolute_error)...")
     point = train_model(loss="absolute_error", quantile=None, out_path="models/ttb_point_log.pkl")
@@ -220,6 +336,26 @@ def main() -> int:
     # Huber loss model for robust prediction (handles heavy-tailed distribution better)
     print("\n[TRAIN] Training Huber loss model (robust to outliers)...")
     huber = train_model(loss="huber", quantile=None, out_path="models/ttb_huber_log.pkl")
+
+    # Optional: LightGBM model
+    lightgbm = None
+    if args.use_lightgbm and HAS_LIGHTGBM:
+        print("\n[TRAIN] Training LightGBM model (advanced gradient boosting)...")
+        lightgbm = train_lightgbm_model(X_train, X_test, y_train_log, y_test, 
+                                       sample_weights_train, censored_test, 
+                                       pre, args.seed, "models/ttb_lightgbm_log.pkl")
+    elif args.use_lightgbm and not HAS_LIGHTGBM:
+        print("\n[SKIP] LightGBM requested but not installed. Run: pip install lightgbm")
+    
+    # Optional: XGBoost model
+    xgboost_model = None
+    if args.use_xgboost and HAS_XGBOOST:
+        print("\n[TRAIN] Training XGBoost model (advanced gradient boosting)...")
+        xgboost_model = train_xgboost_model(X_train, X_test, y_train_log, y_test,
+                                            sample_weights_train, censored_test,
+                                            pre, args.seed, "models/ttb_xgboost_log.pkl")
+    elif args.use_xgboost and not HAS_XGBOOST:
+        print("\n[SKIP] XGBoost requested but not installed. Run: pip install xgboost")
 
     report = {
         "rows_total": int(len(df)),
@@ -253,10 +389,16 @@ def main() -> int:
             "features": "AIS-only, leakage-safe, vessel metadata included",
             "censoring": "Included in training, excluded from evaluation metrics",
             "evaluation": "Metrics computed on completed events only",
-            "sample_weighting": "2x weight for TTB > 50h",
+            "sample_weighting": "0.5x for >350h, 2.0x for <=350h",
             "outlier_handling": f"Labels capped at {args.max_label_hours}h"
         }
     }
+    
+    # Add optional models if trained
+    if lightgbm is not None:
+        report["models"]["lightgbm"] = lightgbm
+    if xgboost_model is not None:
+        report["models"]["xgboost"] = xgboost_model
 
     with open("logs/ttb_train_report_v2.json", "w") as f:
         json.dump(report, f, indent=2)
@@ -289,19 +431,29 @@ def main() -> int:
 
     print(f"\n[TRAIN_V2] point: MAE={point['mae']:.2f}h P90AE={point['p90ae']:.2f}h bias={point['bias']:.2f}h")
     print(f"[TRAIN_V2] huber: MAE={huber['mae']:.2f}h P90AE={huber['p90ae']:.2f}h bias={huber['bias']:.2f}h")
+    if lightgbm is not None:
+        print(f"[TRAIN_V2] lgbm : MAE={lightgbm['mae']:.2f}h P90AE={lightgbm['p90ae']:.2f}h bias={lightgbm['bias']:.2f}h")
+    if xgboost_model is not None:
+        print(f"[TRAIN_V2] xgb  : MAE={xgboost_model['mae']:.2f}h P90AE={xgboost_model['p90ae']:.2f}h bias={xgboost_model['bias']:.2f}h")
     print(f"[TRAIN_V2] q50  : MAE={q50['mae']:.2f}h P90AE={q50['p90ae']:.2f}h bias={q50['bias']:.2f}h")
     print(f"[TRAIN_V2] q75  : MAE={q75['mae']:.2f}h P90AE={q75['p90ae']:.2f}h bias={q75['bias']:.2f}h")
     print(f"[TRAIN_V2] q90  : MAE={q90['mae']:.2f}h P90AE={q90['p90ae']:.2f}h bias={q90['bias']:.2f}h")
     
     # Performance assessment
     print("\n" + "="*60)
-    print("PERFORMANCE ASSESSMENT")
+    print("PERFORMANCE ASSESSMENT & MODEL COMPARISON")
     print("="*60)
     
-    # Choose best model based on MAE (typically Huber for heavy-tailed data)
-    best_model = huber if huber['mae'] < point['mae'] else point
-    model_name = "Huber" if best_model == huber else "Point"
-    print(f"\nBest Model: {model_name} (MAE={best_model['mae']:.2f}h)")
+    # Compare all regression models (exclude quantile models)
+    regression_models = [("Point", point), ("Huber", huber)]
+    if lightgbm is not None:
+        regression_models.append(("LightGBM", lightgbm))
+    if xgboost_model is not None:
+        regression_models.append(("XGBoost", xgboost_model))
+    
+    # Find best model
+    best_model_name, best_model = min(regression_models, key=lambda x: x[1]['mae'])
+    print(f"\n🏆 Best Regression Model: {best_model_name} (MAE={best_model['mae']:.2f}h)")
     
     if best_model['mae'] < 20:
         print("✅ MAE: GOOD (<20h)")

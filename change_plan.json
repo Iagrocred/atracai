@@ -1,0 +1,61 @@
+to-brasil/atracai # echo "===== change_plan.json ====="
+cat change_plan.json
+===== change_plan.json =====
+{
+  "version": "v1",
+  "scope": "STS only",
+  "root_causes": [
+    {
+      "rank": 1,
+      "cause": "Incorrect port_zone_roles configuration for STS, leading to misdefined QUEUE/BASIN zones and wrong anchorage_queue_start_utc/basin_start_utc.",
+      "references": [
+        "calls/build_port_calls_multiport.py",
+        "table: port_zone_roles"
+      ]
+    },
+    {
+      "rank": 2,
+      "cause": "Heavy-tail handling via capping at --cap-hours (default 336h) in calls/build_time_to_berth_labels.py truncates long waits, biasing model training.",
+      "references": [
+        "calls/build_time_to_berth_labels.py",
+        "DB_SNAPSHOT.md STS TTB distribution"
+      ]
+    },
+    {
+      "rank": 3,
+      "cause": "No censoring handling for right-censored events (e.g., vessels still waiting), missing survival analysis techniques.",
+      "references": [
+        "table: port_calls_multiport",
+        "calls/build_time_to_berth_labels.py"
+      ]
+    },
+    {
+      "rank": 4,
+      "cause": "Limited feature set: features in ml_training_samples_multiport only include congestion counts and calendar variables, lacking vessel metadata (DWT, draft), weather, or terminal factors.",
+      "references": [
+        "calls/build_time_to_berth_labels.py",
+        "table: vessel_info"
+      ]
+    },
+    {
+      "rank": 5,
+      "cause": "Potential data gaps from AIS dropouts, handled by --max-gap-min in calls/build_berth_calls_multiport.py but may not capture operational nuances.",
+      "references": [
+        "calls/build_berth_calls_multiport.py",
+        "table: ais_positions"
+      ]
+    }
+  ],
+  "required_changes": {
+    "config/port_zone_roles_sts.csv": "Update with verified STS zone definitions (QUEUE, BASIN, ANCHORAGE) based on port maps and AIS data validation.",
+    "calls/build_port_calls_multiport.py": "Modify SQL block to join port_zone_roles with stricter geospatial checks, ensuring correct zone timestamps for STS.",
+    "calls/build_time_to_berth_labels.py": "Replace capping with censored data handling (add censoring_flag logic) and integrate survival analysis features (e.g., Kaplan-Meier estimates).",
+    "ml/build_ttb_training_multiport.py": "Expand features JSONB to include vessel_info columns (deadweight, draught_avg), weather data (via external API), and terminal-specific factors (berth_id patterns).",
+    "ml/train_ttb_models_by_port.py": "Incorporate quantile regression or survival models (e.g., Cox PH) alongside current HGB, with calibration metrics (ECE, CRPS)."
+  },
+  "explicit_non_changes": {
+    "ais_positions table": "Keep existing schema and ingestion pipeline to maintain AIS-first approach.",
+    "berth_calls_multiport table": "No schema changes; rely on current berth detection logic for backward compatibility.",
+    "real-time inference API": "Maintain current endpoint structure; enhancements are feature-based only."
+  },
+  "testing_plan": "1. Zone Validation: Cross-check port_zone_roles against STS port maps for 95% accuracy. 2. Temporal Split: Train on data before 2024, test on 2024 onwards. 3. Metrics: Compute MAE, bias, coverage at 90% on test set. 4. Anti-Leakage Audit: Verify features use only past data via timestamp constraints. 5. Performance: Benchmark against baseline capping model using paired t-tests."
